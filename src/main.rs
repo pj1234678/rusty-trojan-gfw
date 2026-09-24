@@ -19,9 +19,24 @@ const LISTEN_PORT: u16 = 443;
 const CERT_FILE: &str = "server.crt";
 const KEY_FILE: &str = "server.key";
 const BUFFER_SIZE: usize = 4096;
+// --- DoS caps (SEC FIX): bound authenticated UDP session growth ---
+const MAX_UDP_BUFFER: usize = 64 * 1024; // tcp_buffer cap (was unbounded)
+const MAX_UDP_PEERS: usize = 64; // allowed_peers cap (was unbounded)
+const UDP_DNS_TIMEOUT_SECS: u64 = 5; // parity with TCP DNS timeout (was none)
+// --- DoS lifetimes (SEC FIX): bound renewable-idle pins (were infinite) ---
+const MAX_SESSION_SECS: u64 = 3600; // TCP/UDP authed sessions absolute cap
+const MAX_FALLBACK_SECS: u64 = 300; // fallback (unauth) absolute cap
+const MAX_UDP_DNS_PER_READ: usize = 8; // domain lookups per TCP read (was unbounded N*5s)
 // ---------------------
 
 static PASSWORD_HASH: OnceLock<String> = OnceLock::new();
+// Pre-parsed loopback backend (perf: avoids per-probe string parse + dispatch;
+// BACKEND_ADDR const + log text kept for tests).
+static BACKEND_SA: OnceLock<SocketAddr> = OnceLock::new();
+
+fn backend_addr() -> SocketAddr {
+    *BACKEND_SA.get_or_init(|| BACKEND_ADDR.parse().expect("BACKEND_ADDR must parse"))
+}
 
 fn init_password_hash(password: &str) {
     PASSWORD_HASH.get_or_init(|| sha224_hex(password));
@@ -166,20 +181,50 @@ fn sha224(message: &[u8]) -> [u8; 28] {
 fn is_private_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => {
+            let o = ipv4.octets();
             ipv4.is_loopback()           // 127.0.0.0/8
             || ipv4.is_private()         // 10/8, 172.16/12, 192.168/16
             || ipv4.is_link_local()      // 169.254.0.0/16
             || ipv4.is_broadcast()       // 255.255.255.255
             || ipv4.is_documentation()   // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
-            || ipv4.is_unspecified()     // 0.0.0.0
+            // --- SEC FIX: close SSRF gaps (smuggled hop to private) ---
+            || o[0] == 0                 // 0.0.0.0/8 ("this network"; was only 0.0.0.0)
+            || (o[0] == 100 && (o[1] & 0xC0) == 0x40) // 100.64.0.0/10 CGNAT shared
+            || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 benchmarking
+            || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IANA special
+            || (o[0] & 0xF0) == 0xE0     // 224.0.0.0/4 multicast (was unchecked)
+            || (o[0] & 0xF0) == 0xF0     // 240.0.0.0/4 reserved (covers broadcast)
         }
         IpAddr::V6(ipv6) => {
+            // --- SEC FIX: unwrap embedded IPv4 first so ::ffff:127.0.0.1 is
+            // judged as 127.0.0.1 (was ALLOWED via segments()[0]==0 miss) ---
+            if let Some(mapped) = ipv6.to_ipv4_mapped() {
+                return is_private_address(IpAddr::V4(mapped));
+            }
+            // Deprecated compat ::a.b.c.d (first 96 bits zero) — to_ipv4_mapped
+            // misses it; judge the embedded V4 the same way.
+            let oct = ipv6.octets();
+            if oct[..12] == [0; 12] && oct[12..] != [0, 0, 0, 0] {
+                let v4 = Ipv4Addr::new(oct[12], oct[13], oct[14], oct[15]);
+                // ::1 is loopback (blocked below anyway); everything else
+                // ::a.b.c.d inherits the V4 verdict.
+                if v4.octets() != [0, 0, 0, 1] || ipv6.is_loopback() {
+                    return is_private_address(IpAddr::V4(v4));
+                }
+            }
             ipv6.is_loopback()           // ::1
             || ipv6.is_unspecified()     // ::
-            // ULA: fc00::/7
-            || (ipv6.segments()[0] & 0xfe00) == 0xfc00
-            // Link-local: fe80::/10
-            || (ipv6.segments()[0] & 0xffc0) == 0xfe80
+            || ipv6.is_multicast()       // ff00::/8 (was allowed)
+            // documentation 2001:db8::/32 (was allowed); hoisted segments
+            // (throughput: one segments() call instead of four).
+            || ({
+                let seg = ipv6.segments();
+                (seg[0] == 0x2001 && seg[1] == 0x0db8)
+                // ULA: fc00::/7
+                || (seg[0] & 0xfe00) == 0xfc00
+                // Link-local: fe80::/10
+                || (seg[0] & 0xffc0) == 0xfe80
+            })
         }
     }
 }
@@ -199,18 +244,33 @@ fn is_allowed_peer(allowed: &HashSet<SocketAddr>, addr: &SocketAddr) -> bool {
 
 /// Record a relay peer, skipping the redundant re-insert when the target is
 /// unchanged from the previous datagram (the common same-destination run:
-/// DNS bursts, calls, streams). The resulting set is identical to
-/// unconditional `insert` in all cases; only wasted re-hashing is removed.
+/// DNS bursts, calls, streams). Caps the set at MAX_UDP_PEERS (DoS fix):
+/// returns false when a NEW peer is dropped due to the cap (caller must skip
+/// forwarding); true when the peer is already known or newly added.
 #[inline]
 fn note_allowed_peer(
     allowed: &mut HashSet<SocketAddr>,
     last: &mut Option<SocketAddr>,
     target: SocketAddr,
-) {
-    if *last != Some(target) {
-        allowed.insert(target);
-        *last = Some(target);
+) -> bool {
+    if *last == Some(target) {
+        return true;
     }
+    // Throughput: same-verdict hybrid gate (linear <=8, hash beyond) avoids a
+    // SipHash on tiny-set misses; steady runs already returned above.
+    if is_allowed_peer(allowed, &target) {
+        *last = Some(target);
+        return true;
+    }
+    if allowed.len() >= MAX_UDP_PEERS {
+        // Silent cap-drop (throughput: was println! per new target, bypassable
+        // via alternating A,B which defeats the last-suppress; caller counts).
+        *last = Some(target); // suppress repeat work for same run
+        return false;
+    }
+    allowed.insert(target);
+    *last = Some(target);
+    true
 }
 
 fn parse_address(data: &[u8], cursor: &mut usize) -> Result<String, String> {
@@ -346,9 +406,9 @@ fn parse_udp_packet_parts(
     let payload_len = u16::from_be_bytes([data[cursor], data[cursor + 1]]) as usize;
     cursor += 2;
 
-    // Check for CRLF
+    // Check for CRLF (silent drop on malformed: DoS fix — was println! per packet,
+    // attacker-triggerable at line rate, blocking Tokio worker on stdout lock).
     if data.len() < cursor + 2 || &data[cursor..cursor + 2] != b"\r\n" {
-        println!("WARN: Malformed UDP packet: missing CRLF after length");
         return None;
     }
     cursor += 2;
@@ -521,7 +581,15 @@ async fn handle_udp_associate(
     let mut allowed_peers = HashSet::new();
     // Last forwarded target: skips redundant set re-inserts on runs.
     let mut last_allowed: Option<SocketAddr> = None;
+    // Throughput: per-session drop counters (were println! per datagram,
+    // blocking Tokio worker on stdout lock at line rate). Summarized at close.
+    let mut ssrf_drops: u64 = 0;
+    let mut dns_fails: u64 = 0;
+    let mut fwd_fails: u64 = 0;
+    let mut cap_drops: u64 = 0;
     // Scratch reply buffer, reused across datagrams (see `encode_..._into`).
+    // Throughput: lazy (0-reply sessions pin no 4KB); first reply reserves via
+    // the existing reserve path, steady-state alloc-free after that.
     let mut encode_scratch = Vec::new();
     let mut tcp_buffer = initial_payload;
     let mut temp_tcp_buf = [0u8; BUFFER_SIZE];
@@ -533,6 +601,9 @@ async fn handle_udp_associate(
     let timeout_duration = Duration::from_secs(300);
     let sleep_future = sleep(timeout_duration);
     tokio::pin!(sleep_future); // Pin the timer so we can reset it in the loop
+    // --- SEC FIX (DoS): absolute session lifetime (was infinite renewable) ---
+    let deadline = sleep(Duration::from_secs(MAX_SESSION_SECS));
+    tokio::pin!(deadline);
 
     loop {
         tokio::select! {
@@ -549,6 +620,12 @@ async fn handle_udp_associate(
                     }
                 };
                 
+                // Cap before extend (throughput): skip memcpy+grow of garbage that
+                // will be discarded anyway. Same verdict as extend-then-check.
+                if tcp_buffer.len().saturating_add(n) > MAX_UDP_BUFFER {
+                    println!("WARN: UDP tcp_buffer cap exceeded ({} > {}), closing session", tcp_buffer.len().saturating_add(n), MAX_UDP_BUFFER);
+                    break;
+                }
                 tcp_buffer.extend_from_slice(&temp_tcp_buf[..n]);
 
                 // Process all fully framed UDP packets in the buffer.
@@ -556,6 +633,8 @@ async fn handle_udp_associate(
                 // per packet would memmove the tail every time (quadratic
                 // for pipelined bursts). Same bytes in the same order.
                 let mut tcp_consumed: usize = 0;
+                // --- SEC FIX (DoS): bound N*5s sequential DNS stall per read ---
+                let mut dns_lookups_this_read: usize = 0;
                 while tcp_consumed < tcp_buffer.len() {
                     if let Some((target, dest_port, payload_range, packet_size)) =
                         parse_udp_packet_parts(&tcp_buffer[tcp_consumed..])
@@ -571,16 +650,21 @@ async fn handle_udp_associate(
                                 let target_addr = SocketAddr::new(ip, dest_port);
                                 // --- SEC FIX: UDP SSRF Prevention ---
                                 if is_private_address(target_addr.ip()) {
-                                    println!("WARN: UDP SSRF block: {}:{} resolved to private address {}", ip, dest_port, target_addr.ip());
-                                } else {
-                                    // Trust this target IP to reply to us later
-                                    note_allowed_peer(&mut allowed_peers, &mut last_allowed, target_addr);
-                                    if let Err(e) = udp_socket.send_to(&tcp_buffer[payload_range], target_addr).await {
-                                        println!("WARN: Failed to forward UDP to {}: {}", target_addr, e);
-                                    }
+                                    ssrf_drops += 1;
+                                } else if !note_allowed_peer(&mut allowed_peers, &mut last_allowed, target_addr) {
+                                    // Cap reached: drop forwarding (DoS fix), no reply trust.
+                                    cap_drops += 1;
+                                } else if let Err(_e) = udp_socket.send_to(&tcp_buffer[payload_range], target_addr).await {
+                                    fwd_fails += 1;
                                 }
                             }
                             UdpTarget::Domain(domain_range) => {
+                                // Defer excess domains to a later read: caps one TCP
+                                // event to MAX_UDP_DNS_PER_READ*5s (was unbounded N*5s).
+                                if dns_lookups_this_read >= MAX_UDP_DNS_PER_READ {
+                                    break;
+                                }
+                                dns_lookups_this_read += 1;
                                 let domain_range = domain_range.start + tcp_consumed..domain_range.end + tcp_consumed;
                                 // Borrowed domain text; the `(host, port)`
                                 // tuple resolves identically to the
@@ -588,22 +672,23 @@ async fn handle_udp_associate(
                                 // (Parts validated UTF-8 to reach this arm.)
                                 let domain = std::str::from_utf8(&tcp_buffer[domain_range])
                                     .expect("parts validated domain UTF-8");
-                                match tokio::net::lookup_host((domain, dest_port)).await {
-                                Ok(mut addrs) => {
+                                // --- SEC FIX (DoS): bound slow-DNS stall (was no timeout) ---
+                                match timeout(Duration::from_secs(UDP_DNS_TIMEOUT_SECS), tokio::net::lookup_host((domain, dest_port))).await {
+                                Ok(Ok(mut addrs)) => {
                                     if let Some(target_addr) = addrs.next() {
                                         // --- SEC FIX: UDP SSRF Prevention ---
                                         if is_private_address(target_addr.ip()) {
-                                            println!("WARN: UDP SSRF block: {}:{} resolved to private address {}", domain, dest_port, target_addr.ip());
-                                        } else {
-                                            // Trust this target IP to reply to us later
-                                            note_allowed_peer(&mut allowed_peers, &mut last_allowed, target_addr);
-                                            if let Err(e) = udp_socket.send_to(&tcp_buffer[payload_range], target_addr).await {
-                                                println!("WARN: Failed to forward UDP to {}: {}", target_addr, e);
-                                            }
+                                            ssrf_drops += 1;
+                                        } else if !note_allowed_peer(&mut allowed_peers, &mut last_allowed, target_addr) {
+                                            // Cap reached: drop (DoS fix).
+                                            cap_drops += 1;
+                                        } else if let Err(_e) = udp_socket.send_to(&tcp_buffer[payload_range], target_addr).await {
+                                            fwd_fails += 1;
                                         }
                                     }
                                 }
-                                Err(e) => println!("WARN: UDP DNS resolution failed for {}:{}: {}", domain, dest_port, e),
+                                Ok(Err(_e)) => dns_fails += 1,
+                                Err(_) => dns_fails += 1,
                                 }
                             }
                         }
@@ -615,13 +700,22 @@ async fn handle_udp_associate(
                 if tcp_consumed > 0 {
                     if tcp_consumed >= tcp_buffer.len() {
                         tcp_buffer.clear();
+                        // MEM FIX: keep 8KB headroom instead of 0 or 64KB — a
+                        // burst retained for 1h is freed, steady 100B/1400B and
+                        // split/multi traffic (<=4KB/event) never trips it.
+                        if tcp_buffer.capacity() > 8192 {
+                            tcp_buffer.shrink_to(8192);
+                        }
                     } else {
                         tcp_buffer.drain(..tcp_consumed);
                     }
                 }
 
-                // Reset our idle timeout since we saw client activity
-                sleep_future.as_mut().reset(Instant::now() + timeout_duration);
+                // Reset idle timeout only on forward progress (DoS fix): 1B of
+                // garbage must not pin the session for another 5 minutes.
+                if tcp_consumed > 0 {
+                    sleep_future.as_mut().reset(Instant::now() + timeout_duration);
+                }
             }
 
             // ========================================================
@@ -647,8 +741,13 @@ async fn handle_udp_associate(
                                 println!("ERROR: Failed to write UDP response to TCP client: {}", e);
                                 break; // Client disconnected unexpectedly
                             }
+                            // Reset only on allowed replies (DoS fix): spoofed
+                            // drops must not pin the timer.
+                            sleep_future.as_mut().reset(Instant::now() + timeout_duration);
                         } else {
-                            println!("WARN: Dropped unexpected UDP packet from {}", addr);
+                            // Silent drop (DoS fix): was println! per spoofed packet,
+                            // triggerable at line rate by any off-path host knowing
+                            // the ephemeral port — stdout lock + disk amplifier.
                         }
                     }
                     Err(e) => {
@@ -656,9 +755,6 @@ async fn handle_udp_associate(
                         break;
                     }
                 }
-
-                // Reset our idle timeout since we saw target activity
-                sleep_future.as_mut().reset(Instant::now() + timeout_duration);
             }
 
             // ========================================================
@@ -668,10 +764,18 @@ async fn handle_udp_associate(
                 println!("INFO: UDP session timed out after 5 minutes of inactivity.");
                 break;
             }
+
+            // ========================================================
+            // EVENT 4: Absolute session lifetime (DoS fix: was infinite)
+            // ========================================================
+            () = &mut deadline => {
+                println!("INFO: UDP session reached absolute lifetime, closing.");
+                break;
+            }
         }
     }
 
-    println!("INFO: Closing UDP tunnel cleanly.");
+    println!("INFO: Closing UDP tunnel cleanly (ssrf_drops={} dns_fails={} fwd_fails={} cap_drops={}).", ssrf_drops, dns_fails, fwd_fails, cap_drops);
     Ok(())
 }
 
@@ -755,17 +859,23 @@ async fn handle_tcp_connect(
     if !initial_data.is_empty() {
         target_stream.write_all(&initial_data).await?;
     }
+    drop(initial_data); // MEM FIX: free before long relay
 
     let (client_read, client_write) = tokio::io::split(client_stream);
     let (target_read, target_write) = tokio::io::split(target_stream);
 
-    let (result1, result2) =
-        relay_full_duplex(client_read, client_write, target_read, target_write).await;
-    if let Err(e) = result1 {
-        println!("ERROR: Client to target pipe error: {}", e);
-    }
-    if let Err(e) = result2 {
-        println!("ERROR: Target to client pipe error: {}", e);
+    // --- SEC FIX (DoS): absolute session lifetime (was infinite renewable) ---
+    match timeout(Duration::from_secs(MAX_SESSION_SECS),
+        relay_full_duplex(client_read, client_write, target_read, target_write)).await {
+        Ok((result1, result2)) => {
+            if let Err(e) = result1 {
+                println!("ERROR: Client to target pipe error: {}", e);
+            }
+            if let Err(e) = result2 {
+                println!("ERROR: Target to client pipe error: {}", e);
+            }
+        }
+        Err(_) => println!("INFO: TCP session reached absolute lifetime, closing."),
     }
 
     Ok(())
@@ -777,7 +887,7 @@ async fn fallback_proxy(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut backend = match timeout(
         Duration::from_secs(5),
-        TcpStream::connect(BACKEND_ADDR)
+        TcpStream::connect(backend_addr())
     ).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
@@ -790,18 +900,30 @@ async fn fallback_proxy(
         }
     };
 
+    // Latency: disable Nagle BEFORE replay (like target leg) so a sub-MSS
+    // replay + instant backend reply skips delayed-ACK; best-effort.
+    if let Err(e) = backend.set_nodelay(true) {
+        println!("WARN: Failed to set TCP_NODELAY on backend socket: {}", e);
+    }
     // Replay any bytes we already read from the client
     if !initial_data.is_empty() {
         backend.write_all(&initial_data).await?;
     }
+    drop(initial_data); // MEM FIX: free replay buffer before long relay
 
     let (client_read, client_write) = tokio::io::split(client_stream);
     let (backend_read, backend_write) = tokio::io::split(backend);
 
-    let (result1, result2) =
-        relay_full_duplex(client_read, client_write, backend_read, backend_write).await;
-    if let Err(e) = result1 { println!("ERROR: Client to backend pipe error: {}", e); }
-    if let Err(e) = result2 { println!("ERROR: Backend to client pipe error: {}", e); }
+    // --- SEC FIX (DoS): absolute fallback lifetime (was infinite renewable) ---
+    // Fallback is unauth camouflage, so its cap is short: trickle pins die here.
+    match timeout(Duration::from_secs(MAX_FALLBACK_SECS),
+        relay_full_duplex(client_read, client_write, backend_read, backend_write)).await {
+        Ok((result1, result2)) => {
+            if let Err(e) = result1 { println!("ERROR: Client to backend pipe error: {}", e); }
+            if let Err(e) = result2 { println!("ERROR: Backend to client pipe error: {}", e); }
+        }
+        Err(_) => println!("INFO: Fallback session reached absolute lifetime, closing."),
+    }
 
     Ok(())
 }
@@ -842,19 +964,31 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    // 32 KiB transfer buffer: bulk flows need ~8x fewer read/write syscalls
-    // than BUFFER_SIZE with byte-identical forwarding (size is internal).
-    let mut buffer = [0u8; 32 * 1024];
+    // 16 KiB transfer buffer (MEM FIX: was 32 KiB): matches the TLS max record
+    // size, so bulk records still fit whole; byte-identical forwarding.
+    // Saves 32KB/session (16MB @512). Bench pipe_data/* are report-only.
+    let mut buffer = [0u8; 16 * 1024];
     loop {
         // --- SEC FIX: 5-Minute Idle Timeout for TCP Connections ---
         match timeout(Duration::from_secs(300), reader.read(&mut buffer)).await {
             Ok(Ok(0)) => break, // Clean EOF
             Ok(Ok(n)) => {
-                writer.write_all(&buffer[..n]).await?;
-                // Push records out promptly instead of letting a tail sit in
-                // the TLS session buffer: same bytes, less tail latency
-                // (bulk tails, interactive frames, speedtest ramp).
-                writer.flush().await?;
+                // Throughput: single 60s budget for write+flush (one timer
+                // insert/cancel instead of two). Same Ok/Err/break mapping:
+                // write/flush errors propagate as Err (write-side asymmetry),
+                // timeout ends the leg cleanly; other leg unaffected (join).
+                // Pushes records promptly (same bytes, less tail latency).
+                match timeout(Duration::from_secs(60), async {
+                    writer.write_all(&buffer[..n]).await?;
+                    writer.flush().await
+                }).await {
+                    Ok(Ok(())) => {},
+                    Ok(Err(e)) => return Err(Box::new(e)),
+                    Err(_) => {
+                        println!("WARN: TCP relay write timed out (slow reader), closing leg.");
+                        break;
+                    }
+                }
             }
             Ok(Err(e)) => {
                 // Ignore common connection resets/broken pipes
@@ -881,6 +1015,17 @@ async fn handle_client(
     semaphore: Arc<Semaphore>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_addr = stream.peer_addr()?;
+    // --- SEC FIX (DoS): cap concurrent handshakes BEFORE TLS ---
+    // The permit used to be acquired AFTER the 10s handshake, so unlimited
+    // bare-TCP holds bypassed MAX_CONNECTIONS entirely. Acquiring first caps
+    // handshake + session holds to 512; exhausted pool drops pre-handshake.
+    let _permit = match semaphore.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            println!("WARN: Connection limit reached, dropping connection from {}.", client_addr);
+            return Ok(());
+        }
+    };
     // Disable Nagle: proxy legs carry latency-sensitive frames (TLS
     // handshakes, small control messages, speedtest ramp); full-size bulk
     // segments are unaffected. Best-effort: never refuse a connection here.
@@ -902,18 +1047,10 @@ async fn handle_client(
     };
     // -------------------------------------------------------------
 
-    // --- SEC FIX: Zombie Connection Pool Exhaustion ---
-    let _permit = match semaphore.try_acquire() {
-        Ok(permit) => permit,
-        Err(_) => {
-            println!("WARN: Connection limit reached, dropping connection from {}.", client_addr);
-            return Ok(());
-        }
-    };
     
-    // Pre-size for a typical header + first data chunk: avoids the first
-    // reallocs with zero observable difference (capacity is invisible).
-    let mut initial_buf = Vec::with_capacity(512);
+    // Handshake buffer is lazy (MEM FIX): capacity is invisible, and the
+    // max header is 320B — avoids 512B/conn upfront (~256KB @512).
+    let mut initial_buf = Vec::new();
     let mut temp_buf = [0u8; BUFFER_SIZE];
     
     // Nginx default client_header_timeout is typically 60 seconds.
@@ -991,14 +1128,18 @@ async fn handle_client(
         Ok(addr) => addr,
         Err(e) => {
             println!("WARN: Invalid address in request: {}. Routing to fallback without password.", e);
-            return fallback_proxy(tls_stream, request_data.to_vec()).await; 
+            let buf = request_data.to_vec();
+            drop(initial_buf); // MEM FIX: free handshake buffer before relay
+            return fallback_proxy(tls_stream, buf).await; 
         }
     };
     
     // Parse port
     if request_data.len() < cursor + 2 {
         println!("WARN: Insufficient data for port. Routing to fallback without password.");
-        return fallback_proxy(tls_stream, request_data.to_vec()).await;
+        let buf = request_data.to_vec();
+        drop(initial_buf); // MEM FIX
+        return fallback_proxy(tls_stream, buf).await;
     }
     
     let port = u16::from_be_bytes([request_data[cursor], request_data[cursor + 1]]);
@@ -1007,26 +1148,33 @@ async fn handle_client(
     // Check final CRLF before the payload
     if request_data.len() < cursor + 2 || &request_data[cursor..cursor + 2] != b"\r\n" {
         println!("WARN: Malformed request: missing final CRLF. Routing to fallback without password.");
-        return fallback_proxy(tls_stream, request_data.to_vec()).await;
+        let buf = request_data.to_vec();
+        drop(initial_buf); // MEM FIX
+        return fallback_proxy(tls_stream, buf).await;
     }
     cursor += 2;
     
     let payload = request_data[cursor..].to_vec();
     
-    // Handle command
+    // Handle command (MEM FIX: initial_buf dropped before long-lived relay;
+    // addr/port/payload are owned, fallback arm clones first)
     match cmd {
         0x01 => {
             // TCP CONNECT
+            drop(initial_buf);
             handle_tcp_connect(tls_stream, addr, port, payload).await
         }
         0x03 => {
             // UDP ASSOCIATE
             println!("INFO: UDP ASSOCIATE request received");
+            drop(initial_buf);
             handle_udp_associate(tls_stream, payload).await
         }
         _ => {
             println!("WARN: Unsupported command: {}. Routing to fallback without password.", cmd);
-            fallback_proxy(tls_stream, request_data.to_vec()).await
+            let buf = request_data.to_vec();
+            drop(initial_buf);
+            fallback_proxy(tls_stream, buf).await
         }
     }
 }
@@ -1150,6 +1298,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
+
+        // --- SEC FIX (DoS): shed load BEFORE spawn (was spawn-then-drop) ---
+        // Full pool previously still paid spawn + task + FD briefly per SYN.
+        // Dropping here avoids that churn; the in-handler cap remains as backup.
+        if semaphore.available_permits() == 0 {
+            println!("WARN: Connection limit reached pre-spawn, dropping.");
+            drop(stream);
+            continue;
+        }
 
         let acceptor = tls_acceptor.clone();
         let sem = Arc::clone(&semaphore);
@@ -1505,8 +1662,9 @@ mod exact_functionality_tests {
 
     #[test]
     fn test_v4_unspecified_boundary_quirk() {
-        // Only 0.0.0.0 is unspecified; 0.0.0.1 is currently ALLOWED.
-        assert!(!is_private_address(v4(0, 0, 0, 1)));
+        // SEC FIX: whole 0.0.0.0/8 is blocked (was only 0.0.0.0).
+        assert!(is_private_address(v4(0, 0, 0, 1)));
+        assert!(is_private_address(v4(0, 0, 0, 0)));
     }
 
     #[test]
@@ -1519,9 +1677,9 @@ mod exact_functionality_tests {
 
     #[test]
     fn test_v4_multicast_not_blocked_quirk() {
-        // Current impl does NOT check is_multicast, so multicast is ALLOWED.
-        assert!(!is_private_address(v4(224, 0, 0, 1)));
-        assert!(!is_private_address(v4(239, 255, 255, 250)));
+        // SEC FIX: multicast 224.0.0.0/4 is now BLOCKED.
+        assert!(is_private_address(v4(224, 0, 0, 1)));
+        assert!(is_private_address(v4(239, 255, 255, 250)));
     }
 
     // ------------------------------------------------------------------------
@@ -1575,17 +1733,62 @@ mod exact_functionality_tests {
 
     #[test]
     fn test_v6_documentation_and_multicast_allowed_quirk() {
-        // Current impl does NOT block documentation or multicast for v6.
-        assert!(!is_private_address(v6("2001:db8::1")));
-        assert!(!is_private_address(v6("ff02::1")));
+        // SEC FIX: v6 documentation + multicast are now BLOCKED.
+        assert!(is_private_address(v6("2001:db8::1")));
+        assert!(is_private_address(v6("ff02::1")));
     }
 
     #[test]
     fn test_v6_mapped_ipv4_allowed_quirk() {
-        // IPv4-mapped ::ffff:127.0.0.1 has segments()[0]==0 so it is NOT
-        // caught by the v6 ULA/link-local checks — currently ALLOWED.
+        // SEC FIX: IPv4-mapped embeds are judged as V4 — all private maps BLOCKED.
         let mapped: Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
-        assert!(!is_private_address(IpAddr::V6(mapped)));
+        assert!(is_private_address(IpAddr::V6(mapped)));
+        let mapped10: Ipv6Addr = "::ffff:10.0.0.1".parse().unwrap();
+        assert!(is_private_address(IpAddr::V6(mapped10)));
+        // Public maps stay allowed (no over-block).
+        let mapped_pub: Ipv6Addr = "::ffff:8.8.8.8".parse().unwrap();
+        assert!(!is_private_address(IpAddr::V6(mapped_pub)));
+    }
+
+    // SEC FIX regression: the smuggled hop to 192.168.2.1 via ::ffff:192.168.2.1
+    // (proven live: direct BLOCKED, mapped ATTEMPTED connect) must now BLOCK both.
+    #[test]
+    fn test_ssrf_smuggled_private_mapped_blocked_regression() {
+        // Direct private targets blocked (baseline).
+        for ip in ["127.0.0.1", "10.0.0.1", "192.168.2.1", "169.254.169.254", "0.0.0.1"] {
+            assert!(is_private_address(ip.parse::<IpAddr>().unwrap()), "direct {} must block", ip);
+        }
+        // Same destinations via IPv4-mapped IPv6 must also block (was ALLOWED).
+        for mapped in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.2.1",
+            "::ffff:169.254.169.254",
+            "::ffff:0.0.0.1",
+            "::ffff:224.0.0.1",
+        ] {
+            let ip: IpAddr = mapped.parse().unwrap();
+            assert!(is_private_address(ip), "mapped {} must block (smuggle fix)", mapped);
+        }
+        // Specials blocked.
+        for ip in ["0.0.0.1", "100.64.0.1", "198.18.0.1", "224.0.0.1", "240.0.0.1", "192.0.0.170"] {
+            assert!(is_private_address(ip.parse::<IpAddr>().unwrap()), "{} must block", ip);
+        }
+        // Public stays allowed (proxy to google.com must keep working).
+        for ip in ["8.8.8.8", "1.1.1.1", "::ffff:8.8.8.8"] {
+            assert!(!is_private_address(ip.parse::<IpAddr>().unwrap()), "{} must stay allowed", ip);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_e2e_tcp_mapped_private_blocked_regression() {
+        // Live proof of the fix: valid auth + mapped ::ffff:127.0.0.1 must now
+        // SSRF-block exactly like direct 127.0.0.1 (was: attempted connect 10049).
+        ensure_test_password();
+        let mapped: Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
+        let hdr = build_trojan_header(TEST_PASSWORD, 0x01, 0x04, &mapped.octets(), 80, b"");
+        let msg = run_handle_client_with_input(hdr).await.unwrap_err();
+        assert!(msg.contains("Blocked private address"), "mapped must block now, got: {}", msg);
     }
 
     // ------------------------------------------------------------------------
@@ -2801,8 +3004,9 @@ mod exact_functionality_tests {
     #[tokio::test]
     async fn test_e2e_semaphore_exhausted_drops_ok_immediately() {
         ensure_test_password();
-        // Zero-permit semaphore: try_acquire always fails -> handler returns
-        // Ok(()) immediately after handshake (drop, no fallback, no block).
+        // Zero-permit semaphore: try_acquire fails PRE-handshake now (DoS fix:
+        // permit caps handshakes too), so the server drops TCP immediately and
+        // the client handshake fails — either outcome proves the drop.
         let pair = test_tls_matched_pair();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2814,23 +3018,33 @@ mod exact_functionality_tests {
                 .map_err(|e| e.to_string())
         });
         let tcp = TcpStream::connect(addr).await.unwrap();
-        let mut tls = pair
+        match pair
             .connector
             .connect(ServerName::try_from("localhost").unwrap(), tcp)
             .await
-            .unwrap();
-        // Send a would-be-valid header; it must be ignored (dropped pre-read).
-        let hdr = build_trojan_header(TEST_PASSWORD, 0x01, 0x01, &ipv4_part(8, 8, 8, 8), 80, b"");
-        tls.write_all(&hdr).await.unwrap();
-        tls.flush().await.unwrap();
-        drop(tls);
-        let res = timeout(Duration::from_secs(10), server).await.expect("server hung");
-        let inner = res.unwrap();
-        assert!(
-            inner.is_ok(),
-            "exhausted semaphore must return Ok(drop), got: {:?}",
-            inner
-        );
+        {
+            Err(_) => {
+                // Expected: server dropped pre-handshake due to exhausted pool.
+                let res = timeout(Duration::from_secs(10), server).await.expect("server hung");
+                let inner = res.unwrap();
+                assert!(inner.is_ok(), "pre-handshake drop must return Ok, got: {:?}", inner);
+                return;
+            }
+            Ok(mut tls) => {
+                // Fallback (if handshake raced through): header must still be dropped.
+                let hdr = build_trojan_header(TEST_PASSWORD, 0x01, 0x01, &ipv4_part(8, 8, 8, 8), 80, b"");
+                let _ = tls.write_all(&hdr).await;
+                let _ = tls.flush().await;
+                drop(tls);
+                let res = timeout(Duration::from_secs(10), server).await.expect("server hung");
+                let inner = res.unwrap();
+                assert!(
+                    inner.is_ok(),
+                    "exhausted semaphore must return Ok(drop), got: {:?}",
+                    inner
+                );
+            }
+        }
     }
 
     // ---- initial header 60s timeout (paused clock) --------------------------
@@ -3782,9 +3996,9 @@ mod exact_functionality_tests {
 
     #[test]
     fn test_v4_reserved_240_allowed_quirk() {
-        // 240.0.0.0/4 (reserved) is not checked -> currently ALLOWED.
-        assert!(!is_private_address(v4(240, 0, 0, 1)));
-        assert!(!is_private_address(v4(255, 255, 255, 254)));
+        // SEC FIX: 240.0.0.0/4 (reserved) is now BLOCKED.
+        assert!(is_private_address(v4(240, 0, 0, 1)));
+        assert!(is_private_address(v4(255, 255, 255, 254)));
     }
 
     #[test]
@@ -4574,18 +4788,18 @@ mod exact_functionality_tests {
 
     #[tokio::test]
     async fn test_e2e_tcp_allowed_unroutable_connect_failure_not_blocked() {
-        // 240.0.0.1 is ALLOWED by is_private_address (reserved quirk) but
-        // unroutable, so handle_tcp_connect must pass SSRF+DNS and fail at
-        // TcpStream::connect ("Failed to connect"/unreachable/timeout) —
-        // never fallback, never "Blocked".
+        // 8.8.8.8:81 is public (ALLOWED) but port 81 is closed/filtered, so
+        // handle_tcp_connect must pass SSRF+DNS and fail at TcpStream::connect
+        // ("Failed to connect"/unreachable/timeout) — never fallback, never "Blocked".
+        // (240.0.0.1 was used before the SEC FIX; it is now SSRF-blocked.)
         ensure_test_password();
-        assert!(!is_private_address(v4(240, 0, 0, 1)));
+        assert!(!is_private_address(v4(8, 8, 8, 8)));
         let hdr = build_trojan_header(
             TEST_PASSWORD,
             0x01,
             0x01,
-            &ipv4_part(240, 0, 0, 1),
-            80,
+            &ipv4_part(8, 8, 8, 8),
+            81,
             b"",
         );
         let msg = run_handle_client_with_input(hdr).await.unwrap_err();
@@ -4850,12 +5064,11 @@ mod exact_functionality_tests {
 
     #[test]
     fn test_v4_shared_and_benchmarking_allowed_quirks() {
-        // 100.64.0.0/10 (CGNAT shared) and 198.18.0.0/15 (benchmarking) are
-        // not in Rust's is_private()/is_documentation() sets checked here.
-        assert!(!is_private_address(v4(100, 64, 0, 1)));
-        assert!(!is_private_address(v4(100, 127, 255, 255)));
-        assert!(!is_private_address(v4(198, 18, 0, 1)));
-        assert!(!is_private_address(v4(198, 19, 255, 255)));
+        // SEC FIX: CGNAT shared + benchmarking are now BLOCKED (SSRF-relevant).
+        assert!(is_private_address(v4(100, 64, 0, 1)));
+        assert!(is_private_address(v4(100, 127, 255, 255)));
+        assert!(is_private_address(v4(198, 18, 0, 1)));
+        assert!(is_private_address(v4(198, 19, 255, 255)));
     }
 
     #[test]
@@ -5059,24 +5272,27 @@ mod exact_functionality_tests {
 
     #[tokio::test]
     async fn test_lookup_mapped_ipv6_parses_and_allowed() {
-        // Proves the full bypass chain up to the SSRF gate without needing a
-        // connect: numeric mapped literal resolves locally (no DNS) and the
-        // current is_private_address lets it through (quirk).
+        // SEC FIX: private mapped literals are now BLOCKED at the SSRF gate;
+        // public maps stay allowed (no over-block).
         let mut addrs = tokio::net::lookup_host("::ffff:127.0.0.1:8080").await.unwrap();
         let sa = addrs.next().unwrap();
         assert_eq!(sa.port(), 8080);
-        assert!(!is_private_address(sa.ip()));
+        assert!(is_private_address(sa.ip()));
+        let mut pub_addrs = tokio::net::lookup_host("::ffff:8.8.8.8:8080").await.unwrap();
+        let pub_sa = pub_addrs.next().unwrap();
+        assert!(!is_private_address(pub_sa.ip()));
     }
 
     // ---- E2E UDP: public port-0 has NO port check (unlike TCP) ---------------------
 
     #[tokio::test]
     async fn test_e2e_udp_public_port_zero_no_port_check_clean_exit() {
-        // TCP rejects port 0 upfront; UDP has no such gate. 240.0.0.1 is
-        // public-but-unroutable, so send_to fails harmlessly (logged) and the
-        // session must still exit cleanly on client close.
+        // TCP rejects port 0 upfront; UDP has no such gate. 8.8.8.8 is public,
+        // so send_to(:0) fails harmlessly (logged) and the session must still
+        // exit cleanly on client close. (240.0.0.1 was used before the SEC FIX;
+        // it is now SSRF-blocked, same clean-exit either way.)
         ensure_test_password();
-        let pkt = build_udp_packet_ipv4(Ipv4Addr::new(240, 0, 0, 1), 0, b"z", false);
+        let pkt = build_udp_packet_ipv4(Ipv4Addr::new(8, 8, 8, 8), 0, b"z", false);
         let hdr = build_trojan_header(TEST_PASSWORD, 0x03, 0x01, &ipv4_part(8, 8, 8, 8), 53, &pkt);
         let pair = test_tls_matched_pair();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5111,8 +5327,8 @@ mod exact_functionality_tests {
             TEST_PASSWORD,
             0x01,
             0x01,
-            &ipv4_part(240, 0, 0, 1),
-            80,
+            &ipv4_part(8, 8, 8, 8),
+            81,
             &payload,
         );
         let msg = run_handle_client_with_input(hdr).await.unwrap_err();
@@ -5315,11 +5531,159 @@ mod exact_functionality_tests {
             let mut set = HashSet::new();
             let mut last = None;
             for s in &seq {
-                note_allowed_peer(&mut set, &mut last, *s);
+                // Cap is 64; these tiny seqs never hit it, return must be true.
+                assert!(note_allowed_peer(&mut set, &mut last, *s));
             }
             assert_eq!(set, expected_set, "set diverged for {:?}", seq);
             assert_eq!(last, expected_last, "cache diverged for {:?}", seq);
         }
+    }
+
+    // ---- DoS regression: caps + timeouts ------------------------------------
+
+    #[test]
+    fn test_dos_udp_allowed_peers_cap_enforced() {
+        use std::collections::HashSet;
+        use std::net::SocketAddr;
+        assert_eq!(MAX_UDP_PEERS, 64);
+        let mut set = HashSet::new();
+        let mut last = None;
+        // Fill to cap with distinct public peers.
+        for i in 0..MAX_UDP_PEERS {
+            let sa: SocketAddr = format!("8.8.8.8:{}", 10000 + i).parse().unwrap();
+            assert!(note_allowed_peer(&mut set, &mut last, sa), "fill {} must succeed", i);
+        }
+        assert_eq!(set.len(), MAX_UDP_PEERS);
+        // New distinct peer beyond cap must be dropped (false), set unchanged.
+        let extra: SocketAddr = "8.8.4.4:53".parse().unwrap();
+        assert!(!note_allowed_peer(&mut set, &mut last, extra), "beyond-cap must drop");
+        assert_eq!(set.len(), MAX_UDP_PEERS);
+        assert!(!set.contains(&extra));
+        // Known peer still returns true (no growth, no drop).
+        let known: SocketAddr = "8.8.8.8:10000".parse().unwrap();
+        assert!(note_allowed_peer(&mut set, &mut last, known));
+        assert_eq!(set.len(), MAX_UDP_PEERS);
+    }
+
+    #[test]
+    fn test_dos_udp_buffer_cap_constant_sane() {
+        // 64KB bounds a single session's buffered garbage (was unboundedVec).
+        // Must stay far below OOM yet above any single legitimate flight
+        // (4KB reads, ~4KB max single UDP frame).
+        assert_eq!(MAX_UDP_BUFFER, 64 * 1024);
+        assert!(MAX_UDP_BUFFER >= 16 * 1024);
+        assert_eq!(UDP_DNS_TIMEOUT_SECS, 5);
+    }
+
+    #[tokio::test]
+    async fn test_dos_pipe_data_write_timeout_closes_leg() {
+        // Slow reader: duplex with no reader draining. Fill the 1024B buffer,
+        // then pipe_data's 60s write cap must end the leg instead of hanging.
+        tokio::time::pause();
+        let (_w_hold, r) = tokio::io::duplex(64 * 1024);
+        // Writer side with tiny buffer that the test never reads from.
+        let (w2, _r2_hold) = tokio::io::duplex(1024);
+        // Reader holds 10KB ready; writer buffer (1024) will fill then stall.
+        let big = vec![0x5Au8; 10 * 1024];
+        let big_clone = big.clone();
+        let (mut w1, r1) = tokio::io::duplex(64 * 1024);
+        let feeder = tokio::spawn(async move {
+            let _ = w1.write_all(&big_clone).await;
+        });
+        let handle = tokio::spawn(async move { pipe_data(r1, w2).await });
+        // Advance past the 60s write cap (read side has data, so the 300s
+        // read timeout never fires; only the write cap can end this).
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let res = handle.await.expect("pipe task panicked");
+        assert!(res.is_ok(), "slow-reader write timeout must break cleanly, got {:?}", res.err());
+        let _ = feeder.await;
+        let _ = r;
+    }
+
+    #[tokio::test]
+    async fn test_dos_udp_oversized_garbage_closes_session() {
+        // Authenticated UDP associate fed >64KB of unframed garbage must close
+        // (break on cap) instead of buffering forever. Before the fix the
+        // session stayed open until client close / 5min idle.
+        ensure_test_password();
+        let garbage = vec![0xFFu8; MAX_UDP_BUFFER + 1024];
+        let hdr = build_trojan_header(TEST_PASSWORD, 0x03, 0x01, &ipv4_part(8, 8, 8, 8), 53, &[]);
+        let pair = test_tls_matched_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_client(stream, pair.acceptor, sem).await.map_err(|e| e.to_string())
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut tls = pair.connector.connect(ServerName::try_from("localhost").unwrap(), tcp).await.unwrap();
+        tls.write_all(&hdr).await.unwrap();
+        tls.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tls.write_all(&garbage).await.unwrap();
+        tls.flush().await.unwrap();
+        // Server must break on cap and close TLS (EOF) without us closing first.
+        let mut buf = [0u8; 16];
+        let res = timeout(Duration::from_secs(10), tls.read(&mut buf)).await;
+        drop(tls);
+        let _ = timeout(Duration::from_secs(10), server).await;
+        match res {
+            Ok(Ok(0)) => {}, // clean EOF: cap closed session — fixed
+            Ok(Ok(_)) => {}, // any data/EOF also proves no 5min hang
+            Ok(Err(_)) => {}, // reset also proves close
+            Err(_) => panic!("oversized garbage must close session quickly (cap), not hang"),
+        }
+    }
+
+    #[test]
+    fn test_dos_lifetime_constants_sane() {
+        // Absolute lifetimes bound renewable-idle pins (were infinite).
+        // Fallback (unauth camouflage) is short; authed sessions get 1h.
+        assert_eq!(MAX_SESSION_SECS, 3600);
+        assert_eq!(MAX_FALLBACK_SECS, 300);
+        assert!(MAX_FALLBACK_SECS < MAX_SESSION_SECS);
+        assert_eq!(MAX_UDP_DNS_PER_READ, 8);
+    }
+
+    #[tokio::test]
+    async fn test_dos_relay_absolute_timeout_fires() {
+        // Mechanism proof for the fallback/TCP absolute caps: a relay that
+        // trickles forever (idle never fires) must still die at the absolute
+        // deadline. Paused clock, 300s cap like fallback.
+        tokio::time::pause();
+        let (mut w1, r1) = tokio::io::duplex(256 * 1024);
+        let (w2, mut r2) = tokio::io::duplex(256 * 1024);
+        let (mut w3, r3) = tokio::io::duplex(256 * 1024);
+        let (w4, mut r4) = tokio::io::duplex(256 * 1024);
+        // Trickle both directions every 200s (<300s idle, so idle never fires).
+        let trickle = tokio::spawn(async move {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_secs(200)).await;
+                let _ = w1.write_all(b"x").await;
+                let _ = w3.write_all(b"y").await;
+            }
+        });
+        let relay = tokio::spawn(async move {
+            timeout(Duration::from_secs(300),
+                relay_full_duplex(r1, w2, r3, w4)).await
+        });
+        let drain = tokio::spawn(async move {
+            let mut buf2 = [0u8; 16];
+            let mut buf4 = [0u8; 16];
+            loop {
+                tokio::select! {
+                    r = r2.read(&mut buf2) => { if r.unwrap_or(0) == 0 { break; } }
+                    r = r4.read(&mut buf4) => { if r.unwrap_or(0) == 0 { break; } }
+                    _ = tokio::time::sleep(Duration::from_secs(50)) => {}
+                }
+            }
+        });
+        tokio::time::advance(Duration::from_secs(301)).await;
+        let res = relay.await.expect("relay panicked");
+        assert!(res.is_err(), "absolute 300s must fire despite trickle (idle would not)");
+        trickle.abort();
+        drain.abort();
     }
 
     #[test]
